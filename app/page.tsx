@@ -1,65 +1,224 @@
-import Image from "next/image";
+"use client";
 
-export default function Home() {
+import { Suspense, useRef, useState, useEffect, useCallback, type ComponentRef, type MutableRefObject } from "react";
+import * as THREE from "three";
+import { Canvas, useFrame, type ThreeEvent } from "@react-three/fiber";
+import {
+  CameraControls,
+  ContactShadows,
+  Environment,
+  MeshReflectorMaterial,
+} from "@react-three/drei";
+import { Model as RenaultVan } from "@/Renault_master_panel_van";
+
+type CameraControlsRef = ComponentRef<typeof CameraControls>;
+
+const CAMERA_TUNING = {
+  sensitivityRefDistance: 12,
+  minSensitivity: 0.5,
+  maxSensitivity: 1,
+  truckDistanceFactor: 12,
+  minTruckSpeed: 1,
+  maxTruckSpeed: 2,
+  dollyDistanceFactor: 12,
+  minDollySpeed: 1,
+  maxDollySpeed: .5,
+} as const;
+
+function CameraRig({
+  controlsRef,
+}: {
+  controlsRef: MutableRefObject<CameraControlsRef | null>;
+}) {
+  const hasInitializedLimits = useRef(false);
+  const frameCount = useRef(0);
+
+  useFrame(() => {
+    const controls = controlsRef.current;
+    if (!controls) return;
+
+    if (!hasInitializedLimits.current) {
+      controls.minPolarAngle = Math.PI / 4;
+      controls.maxPolarAngle = Math.PI / 1.5;
+      hasInitializedLimits.current = true;
+    }
+
+    // Otimização: atualiza controles apenas a cada 3 frames
+    frameCount.current++;
+    if (frameCount.current % 3 !== 0) return;
+
+    const dist = controls.distance;
+    const rotationSpeed = THREE.MathUtils.clamp(
+      dist / CAMERA_TUNING.sensitivityRefDistance,
+      CAMERA_TUNING.minSensitivity,
+      CAMERA_TUNING.maxSensitivity,
+    );
+
+    controls.azimuthRotateSpeed = rotationSpeed;
+    controls.polarRotateSpeed = rotationSpeed;
+    controls.truckSpeed = THREE.MathUtils.clamp(
+      dist / CAMERA_TUNING.truckDistanceFactor,
+      CAMERA_TUNING.minTruckSpeed,
+      CAMERA_TUNING.maxTruckSpeed,
+    );
+    controls.dollySpeed = THREE.MathUtils.clamp(
+      dist / CAMERA_TUNING.dollyDistanceFactor,
+      CAMERA_TUNING.minDollySpeed,
+      CAMERA_TUNING.maxDollySpeed,
+    );
+  });
+
+  return null;
+}
+
+export default function Page() {
+  const controlsRef = useRef<CameraControlsRef | null>(null);
+  const [hovered, setHovered] = useState<string | null>(null);
+  const originalMaterialsRef = useRef<Map<string, THREE.Material>>(new Map());
+
+  // Função para mudar o cursor (UX básica)
+  useEffect(() => {
+    document.body.style.cursor = hovered ? 'pointer' : 'auto';
+  }, [hovered]);
+
+  // Event handlers memoizados para performance
+  const handlePointerOver = useCallback((e: ThreeEvent<PointerEvent>) => {
+    e.stopPropagation();
+    const name = e.object.name || e.object.parent?.name || "Peça Oculta";
+    setHovered(name);
+  }, []);
+
+  const handlePointerOut = useCallback(() => {
+    setHovered(null);
+  }, []);
+
+  const handlePointerDown = useCallback((e: ThreeEvent<PointerEvent>) => {
+    e.stopPropagation();
+
+    const target = e.object as THREE.Mesh;
+    const partName = target.name || target.parent?.name || "Desconhecido";
+
+    console.log("🎯 CLIQUE NA VAN DETECTADO!");
+    console.log("Peça:", partName);
+    console.log("ID do Objeto:", target.uuid);
+    console.log("Ponto exato (World):", e.point);
+
+    // Teste visual: muda a cor da peça clicada
+    if (target.material) {
+      // Salva o material original se ainda não foi salvo
+      if (!originalMaterialsRef.current.has(target.uuid)) {
+        originalMaterialsRef.current.set(target.uuid, target.material as THREE.Material);
+      }
+
+      // Clona e aplica a nova cor
+      const material = target.material as THREE.MeshStandardMaterial;
+      const newMaterial = material.clone();
+      newMaterial.color.set('#ff0055');
+      target.material = newMaterial;
+
+      // Cleanup: descarta o material clonado após 2 segundos e restaura o original
+      setTimeout(() => {
+        const originalMaterial = originalMaterialsRef.current.get(target.uuid);
+        if (originalMaterial) {
+          target.material = originalMaterial;
+          newMaterial.dispose();
+        }
+      }, 2000);
+    }
+  }, []);
+
   return (
-    <div className="flex min-h-screen items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex min-h-screen w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
+    <main className="flex h-screen w-full flex-col bg-slate-950">
+      <div className="pointer-events-none absolute left-10 top-10 z-10 text-white">
+        <h1 className="text-4xl font-bold uppercase leading-none tracking-tighter">
+          Van de Pixels
+        </h1>
+        <p className="mt-2 text-sm opacity-70">
+          Use o botao esquerdo para girar e o direito para arrastar.
+        </p>
+      </div>
+
+      <Canvas
+        shadows
+        dpr={[1, 1.5]}
+        camera={{ position: [10, 5, 15], fov: 35 }}
+        performance={{ min: 0.5 }}
+        frameloop="demand"
+      >
+        <color attach="background" args={["#020617"]} />
+        <fog attach="fog" args={["#020617", 22, 30]} />
+
+        <ambientLight intensity={0.2} />
+        <spotLight
+          position={[10, 10, 10]}
+          angle={0.5}
+          penumbra={1}
+          intensity={2}
+          castShadow
         />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
-        </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
+
+        <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, -2.51, 0]} receiveShadow>
+          <planeGeometry args={[50, 50]} />
+          <MeshReflectorMaterial
+            blur={[100, 50]}
+            resolution={256}
+            mixBlur={0.8}
+            mixStrength={20}
+            roughness={1}
+            depthScale={1}
+            minDepthThreshold={0.5}
+            maxDepthThreshold={1.2}
+            color="#050505"
+            metalness={0.3}
+          />
+        </mesh>
+
+        <CameraControls
+          ref={controlsRef}
+          makeDefault
+          dollyToCursor={false}
+          verticalDragToForward={false}
+          minDistance={3}
+          maxDistance={15}
+          azimuthRotateSpeed={0.5}
+          polarRotateSpeed={0.5}
+          dollySpeed={0.4}
+          truckSpeed={0.8}
+          mouseButtons={{
+            left: 1,
+            middle: 0,
+            right: 2,
+            wheel: 16,
+          }}
+        />
+
+        <CameraRig controlsRef={controlsRef} />
+
+        <Suspense fallback={null}>
+          <group
+            position={[0, 0, 0]}
+            onPointerOver={handlePointerOver}
+            onPointerOut={handlePointerOut}
+            onPointerDown={handlePointerDown}
           >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
+            <RenaultVan
+              scale={0.02}
+              rotation={[-Math.PI / 2, 0, 0]}
+              position={[0, -2.5, 0]}
             />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
-        </div>
-      </main>
-    </div>
+          </group>
+          <Environment preset="city" environmentIntensity={0.4} />
+        </Suspense>
+
+        <ContactShadows
+          position={[0, -2.48, 0]}
+          opacity={0.5}
+          scale={30}
+          blur={1.5}
+          far={4}
+          frames={1}
+        />
+      </Canvas>
+    </main>
   );
 }
