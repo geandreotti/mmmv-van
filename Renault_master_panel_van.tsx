@@ -112,11 +112,11 @@ type GLTFResult = GLTF & {
     tire: THREE.MeshStandardMaterial
     windowglass: THREE.MeshStandardMaterial
   }
-  animations: GLTFAction[]
+  animations: THREE.AnimationClip[]
 }
 
-export function Model(props: JSX.IntrinsicElements['group']) {
-  const { nodes, materials } = useGLTF('/renault_master_panel_van.glb') as GLTFResult
+export function Model(props: React.ComponentProps<'group'>) {
+  const { nodes, materials } = useGLTF('/renault_master_panel_van.glb') as unknown as GLTFResult
   return (
     <group {...props} dispose={null}>
       <group rotation={[-Math.PI / 2, 0, 0]}>
