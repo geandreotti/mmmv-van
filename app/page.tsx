@@ -12,7 +12,7 @@ import {
   useTexture,
 } from "@react-three/drei";
 import { DecalGeometry } from "three-stdlib";
-import { RenaultMasterCollider as RenaultVan } from "@/Renault_master_collider";
+import { RenaultMasterCollider as RenaultVan } from "@/Renault_master_collider"; // Substitua pelo caminho correto do modelo
 
 type CameraControlsRef = ComponentRef<typeof CameraControls>;
 
@@ -40,7 +40,11 @@ const CAMERA_BOUNDS = {
 const SHOW_CAMERA_BOUNDS_GIZMO = true;
 const ENABLE_UV_HOVER = false;
 const PIXEL_MAPPING_MODE: "uv" | "surface" = "surface";
-const USE_SIMPLIFIED_COLLIDER_FOR_PICKING = true;
+const USE_SIMPLIFIED_COLLIDER_FOR_PICKING = false;
+const SHOW_COLLIDER_VISUAL = true;
+const COLLIDER_VISUAL_WIREFRAME = true;
+const COLLIDER_VISUAL_OPACITY = 0.35;
+const COLLIDER_VISUAL_COLOR = 0x00e5ff;
 const COLLIDER_MODEL_PATH = "/renault_master_collider.glb";
 const GRID_U = 50;
 const GRID_V = 50;
@@ -340,6 +344,19 @@ function ColliderProxyModel({
       if (!(obj instanceof THREE.Mesh)) return;
 
       const toColliderMaterial = (mat: THREE.Material) => {
+        if (SHOW_COLLIDER_VISUAL) {
+          const visualMat = new THREE.MeshBasicMaterial({
+            color: new THREE.Color(COLLIDER_VISUAL_COLOR),
+            wireframe: COLLIDER_VISUAL_WIREFRAME,
+            transparent: true,
+            opacity: COLLIDER_VISUAL_OPACITY,
+            depthWrite: false,
+            depthTest: true,
+            side: THREE.DoubleSide,
+          });
+          return visualMat;
+        }
+
         const clone = mat.clone();
         clone.transparent = true;
         clone.opacity = 0;
@@ -497,23 +514,43 @@ function VanModel({
   const visualGroupRef = useRef<THREE.Group>(null);
 
   useEffect(() => {
-    if (!visualGroupRef.current) return;
+    console.log("[SHADER DEBUG] FIRST useEffect - Setting up shader on meshes");
+    console.log("[SHADER DEBUG] visualGroupRef.current exists?", !!visualGroupRef.current);
+    console.log("[SHADER DEBUG] SHOW_DEBUG_GRID?", SHOW_DEBUG_GRID);
+    
+    if (!visualGroupRef.current) {
+      console.log("[SHADER DEBUG] !!! visualGroupRef.current is null, returning");
+      return;
+    }
 
     const meshObjects: THREE.Mesh[] = [];
     const meshes: MeshInfo[] = [];
+    let meshFoundCount = 0;
+    
     visualGroupRef.current.traverse((obj) => {
-      if (obj instanceof THREE.Mesh) {
+      if (obj.type === "Mesh") {
+        meshFoundCount++;
+        console.log(`[SHADER DEBUG] Found mesh #${meshFoundCount}:`, {
+          name: obj.name || obj.uuid,
+          hasMaterial: !!obj.material,
+          materialType: obj.material?.constructor?.name,
+          SHOW_DEBUG_GRID,
+        });
+        
         const name = obj.name || obj.parent?.name || "mesh";
         meshes.push({ uuid: obj.uuid, name });
         meshObjects.push(obj);
         
         // Aplica shader de grid debug se habilitado
         if (SHOW_DEBUG_GRID && obj.material) {
+          console.log("[SHADER DEBUG] SHOW_DEBUG_GRID is true, obj.material exists");
           const materials = Array.isArray(obj.material) ? obj.material : [obj.material];
           
           materials.forEach((mat) => {
             if (!mat.userData.hasGridOverlay) {
+              console.log("[SHADER DEBUG] Attaching grid overlay to mesh:", obj.name || obj.uuid);
               mat.onBeforeCompile = (shader) => {
+                console.log("[SHADER DEBUG] !!! onBeforeCompile called - shader is being compiled");
                 // Cria textura para armazenar células pintadas (mais eficiente que array de uniforms)
                 const dataTexture = new THREE.DataTexture(
                   new Float32Array(700 * 4), // 700 células, 4 componentes RGBA
@@ -658,6 +695,8 @@ function VanModel({
               };
               mat.userData.hasGridOverlay = true;
               mat.needsUpdate = true;
+              // Em frameloop='demand', força um frame para recompilar com onBeforeCompile.
+              invalidate();
             }
           });
         }
@@ -668,14 +707,214 @@ function VanModel({
       onMeshRegistry?.(meshes);
     }
     onMeshesReady?.(meshObjects);
+    console.log("[SHADER DEBUG] First useEffect DONE - found", meshFoundCount, "meshes");
   }, [onMeshRegistry, onMeshesReady, useColliderProxy]);
+
+  // ⚠️ MONITORAR CONTINUAMENTE: Attach shader quando mesh receber material
+  useEffect(() => {
+    if (!visualGroupRef.current) return;
+    
+    let intervalId: NodeJS.Timeout | null = null;
+    let lastMeshCount = 0;
+    
+    const tryAttachShaders = () => {
+      let currentMeshCount = 0;
+      let attachedCount = 0;
+      
+      visualGroupRef.current?.traverse((obj) => {
+        if (obj.type === "Mesh" && obj.material) {
+          currentMeshCount++;
+          
+          const materials = Array.isArray(obj.material) ? obj.material : [obj.material];
+          for (const mat of materials) {
+            if (!mat.userData.hasGridOverlay && SHOW_DEBUG_GRID) {
+              console.log("[SHADER DEBUG] ✓ ATTACHING SHADER NOW to mesh:", obj.name || obj.uuid);
+              attachedCount++;
+              
+              mat.onBeforeCompile = (shader) => {
+                console.log("[SHADER DEBUG] !!! onBeforeCompile called");
+                const dataTexture = new THREE.DataTexture(
+                  new Float32Array(700 * 4),
+                  700,
+                  1,
+                  THREE.RGBAFormat,
+                  THREE.FloatType
+                );
+                dataTexture.magFilter = THREE.NearestFilter;
+                dataTexture.minFilter = THREE.NearestFilter;
+                dataTexture.wrapS = THREE.ClampToEdgeWrapping;
+                dataTexture.wrapT = THREE.ClampToEdgeWrapping;
+                dataTexture.generateMipmaps = false;
+                dataTexture.needsUpdate = true;
+                
+                shader.uniforms.gridSize = { value: SURFACE_PIXEL_WORLD_SIZE };
+                shader.uniforms.gridColor = { value: new THREE.Color(0x00ff00) };
+                shader.uniforms.gridOpacity = { value: 0.3 };
+                shader.uniforms.paintColor = { value: new THREE.Color(0xff2d55) };
+                shader.uniforms.useShaderPainting = { value: USE_SHADER_PAINTING };
+                shader.uniforms.paintedCellsTexture = { value: dataTexture };
+                shader.uniforms.numPaintedCells = { value: 0 };
+                
+                shader.vertexShader = shader.vertexShader.replace(
+                  '#include <common>',
+                  `#include <common>\n                  varying vec3 vWorldPosition;`
+                );
+                shader.vertexShader = shader.vertexShader.replace(
+                  '#include <worldpos_vertex>',
+                  `#include <worldpos_vertex>\n                  vWorldPosition = (modelMatrix * vec4(position, 1.0)).xyz;`
+                );
+                
+                shader.fragmentShader = shader.fragmentShader.replace(
+                  '#include <common>',
+                  `#include <common>\n                  varying vec3 vWorldPosition;
+                  uniform float gridSize;
+                  uniform vec3 gridColor;
+                  uniform float gridOpacity;
+                  uniform vec3 paintColor;
+                  uniform bool useShaderPainting;
+                  uniform sampler2D paintedCellsTexture;
+                  uniform int numPaintedCells;`
+                );
+                
+                shader.fragmentShader = shader.fragmentShader.replace(
+                  '#include <tonemapping_fragment>',
+                  `#include <tonemapping_fragment>
+                  vec3 gridPos = vWorldPosition / gridSize;
+                  vec3 cellCoords = floor(gridPos);
+                  vec3 absNormal = abs(normalize(cross(dFdx(vWorldPosition), dFdy(vWorldPosition))));
+                  bool isPlaneYZ = absNormal.x >= absNormal.y && absNormal.x >= absNormal.z;
+                  bool isPlaneXZ = !isPlaneYZ && absNormal.y >= absNormal.z;
+                  float fragmentPlaneId = 2.0;
+                  float fragmentCoord1 = cellCoords.x;
+                  float fragmentCoord2 = cellCoords.y;
+                  if (isPlaneYZ) {
+                    fragmentPlaneId = 0.0;
+                    fragmentCoord1 = cellCoords.y;
+                    fragmentCoord2 = cellCoords.z;
+                  } else if (isPlaneXZ) {
+                    fragmentPlaneId = 1.0;
+                    fragmentCoord1 = cellCoords.x;
+                    fragmentCoord2 = cellCoords.z;
+                  }
+                  bool isPainted = false;
+                  if (useShaderPainting && numPaintedCells > 0) {
+                    for (int i = 0; i < 700; i++) {
+                      if (i >= numPaintedCells) break;
+                      float u = (float(i) + 0.5) / 700.0;
+                      vec4 texelData = texture2D(paintedCellsTexture, vec2(u, 0.5));
+                      bool match = abs(texelData.b - fragmentPlaneId) < 0.1 &&
+                                   abs(texelData.r - fragmentCoord1) < 0.01 &&
+                                   abs(texelData.g - fragmentCoord2) < 0.01;
+                      if (match) {
+                        isPainted = true;
+                        break;
+                      }
+                    }
+                  }
+                  vec3 gridFract = fract(gridPos);
+                  float lineWidth = 0.02;
+                  float gridLine = 0.0;
+                  if (isPlaneYZ) {
+                    if (gridFract.y < lineWidth || gridFract.y > 1.0 - lineWidth ||
+                        gridFract.z < lineWidth || gridFract.z > 1.0 - lineWidth) {
+                      gridLine = 1.0;
+                    }
+                  } else if (isPlaneXZ) {
+                    if (gridFract.x < lineWidth || gridFract.x > 1.0 - lineWidth ||
+                        gridFract.z < lineWidth || gridFract.z > 1.0 - lineWidth) {
+                      gridLine = 1.0;
+                    }
+                  } else {
+                    if (gridFract.x < lineWidth || gridFract.x > 1.0 - lineWidth ||
+                        gridFract.y < lineWidth || gridFract.y > 1.0 - lineWidth) {
+                      gridLine = 1.0;
+                    }
+                  }
+                  if (isPainted) {
+                    gl_FragColor.rgb = paintColor;
+                  }
+                  gl_FragColor.rgb = mix(gl_FragColor.rgb, gridColor, gridLine * gridOpacity);`
+                );
+                
+                mat.userData.shaderUniforms = shader.uniforms;
+              };
+              mat.userData.hasGridOverlay = true;
+              mat.needsUpdate = true;
+              invalidate();
+            }
+          }
+        }
+      });
+      
+      if (currentMeshCount > lastMeshCount) {
+        console.log(`[SHADER DEBUG] Mesh count increased: ${lastMeshCount} → ${currentMeshCount}, attached: ${attachedCount}`);
+        lastMeshCount = currentMeshCount;
+      }
+    };
+    
+    tryAttachShaders();
+    intervalId = setInterval(tryAttachShaders, 100);
+    
+    return () => {
+      if (intervalId) clearInterval(intervalId);
+    };
+  }, [invalidate]);
+
+  // ⚠️ Registrar meshes no dropdown quando tiverem shader
+  useEffect(() => {
+    if (!visualGroupRef.current || !onMeshRegistry) return;
+    
+    let lastRegisteredCount = 0;
+    let intervalId: NodeJS.Timeout | null = null;
+    
+    const registerMeshesWithShaders = () => {
+      const meshesToRegister: MeshInfo[] = [];
+      
+      visualGroupRef.current?.traverse((obj) => {
+        if (obj.type === "Mesh" && obj.material) {
+          const materials = Array.isArray(obj.material) ? obj.material : [obj.material];
+          for (const mat of materials) {
+            if (mat.userData.hasGridOverlay) {
+              const name = obj.name || obj.parent?.name || "mesh";
+              meshesToRegister.push({ uuid: obj.uuid, name });
+              break;
+            }
+          }
+        }
+      });
+      
+      if (meshesToRegister.length > lastRegisteredCount) {
+        console.log("[SHADER DEBUG] ✓✓✓ Registering", meshesToRegister.length, "meshes in dropdown");
+        lastRegisteredCount = meshesToRegister.length;
+        onMeshRegistry(meshesToRegister);
+      }
+    };
+    
+    registerMeshesWithShaders();
+    intervalId = setInterval(registerMeshesWithShaders, 200);
+    
+    return () => {
+      if (intervalId) clearInterval(intervalId);
+    };
+  }, [onMeshRegistry]);
 
   // Atualiza as células pintadas no shader
   useEffect(() => {
-    if (!USE_SHADER_PAINTING || !paintedCells || !visualGroupRef.current) return;
+    console.log("[SHADER DEBUG] paintedCells update:", {
+      USE_SHADER_PAINTING,
+      paintedCellsSize: paintedCells?.size,
+      hasVisualGroupRef: !!visualGroupRef.current,
+      paintedCellsNull: paintedCells == null,
+    });
+    
+    if (!USE_SHADER_PAINTING || !paintedCells || !visualGroupRef.current) {
+      console.log("[SHADER DEBUG] Early return - one of conditions failed");
+      return;
+    }
 
     // Agrupa por mesh para evitar vazamento de pintura entre malhas diferentes.
     const encodedCellsByMesh = new Map<string, Set<string>>();
+    console.log("[SHADER DEBUG] Starting to process", paintedCells.size, "painted cells");
 
     const addEncodedCell = (
       meshUuid: string,
@@ -719,37 +958,264 @@ function VanModel({
       }
     });
     
-    visualGroupRef.current.traverse((obj) => {
-      if (obj instanceof THREE.Mesh && obj.material) {
-        const encodedCells = encodedCellsByMesh.get(obj.uuid) ?? new Set<string>();
-        const meshCells: number[] = [];
-        for (const encoded of encodedCells) {
-          if (meshCells.length >= 700 * 4) break;
-          const [planeIdRaw, coord1Raw, coord2Raw] = encoded.split(":");
-          const planeId = Number(planeIdRaw);
-          const coord1 = Number(coord1Raw);
-          const coord2 = Number(coord2Raw);
-          if (!Number.isFinite(planeId) || !Number.isFinite(coord1) || !Number.isFinite(coord2)) continue;
-          meshCells.push(coord1, coord2, planeId, 1.0);
-        }
+    const syncPaintDataToShader = () => {
+      console.log("[SHADER DEBUG] SyncPaintDataToShader called");
+      console.log("[SHADER DEBUG] visualGroupRef.current exists?", !!visualGroupRef.current);
+      
+      let didUpdateShaderData = false;
+      let hasPendingShaderCompile = false;
+      let meshCount = 0;
 
-        const cellsArray = meshCells.slice(0, 700 * 4);
-        while (cellsArray.length < 700 * 4) {
-          cellsArray.push(0, 0, 0, 0);
+      visualGroupRef.current?.traverse((obj) => {
+        if (obj.type === "Mesh") {
+          console.log("[SHADER DEBUG] Found Mesh:", {
+            name: obj.name,
+            typeCheck: obj.type === "Mesh",
+            hasMaterial: !!obj.material,
+            materialType: obj.material?.constructor?.name,
+            isMaterial: obj.material instanceof THREE.Material,
+          });
         }
-        const numCells = Math.floor(meshCells.length / 4);
+        
+        if (obj.type === "Mesh" && obj.material) {
+          meshCount++;
+          
+          // ⚠️ FIRST TIME SETUP: Se o shader ainda não foi attachado, faz agora!
+          const materials = Array.isArray(obj.material) ? obj.material : [obj.material];
+          materials.forEach((mat) => {
+            if (!mat.userData.hasGridOverlay && SHOW_DEBUG_GRID) {
+              console.log("[SHADER DEBUG] !!! LATE SHADER ATTACHMENT - mesh just loaded, attaching now");
+              mat.onBeforeCompile = (shader) => {
+                console.log("[SHADER DEBUG] !!! onBeforeCompile called - shader is being compiled");
+                // Cria textura para armazenar células pintadas (mais eficiente que array de uniforms)
+                const dataTexture = new THREE.DataTexture(
+                  new Float32Array(700 * 4), // 700 células, 4 componentes RGBA
+                  700,
+                  1,
+                  THREE.RGBAFormat,
+                  THREE.FloatType
+                );
+                dataTexture.magFilter = THREE.NearestFilter;
+                dataTexture.minFilter = THREE.NearestFilter;
+                dataTexture.wrapS = THREE.ClampToEdgeWrapping;
+                dataTexture.wrapT = THREE.ClampToEdgeWrapping;
+                dataTexture.generateMipmaps = false;
+                dataTexture.needsUpdate = true;
+                
+                shader.uniforms.gridSize = { value: SURFACE_PIXEL_WORLD_SIZE };
+                shader.uniforms.gridColor = { value: new THREE.Color(0x00ff00) };
+                shader.uniforms.gridOpacity = { value: 0.3 };
+                shader.uniforms.paintColor = { value: new THREE.Color(0xff2d55) };
+                shader.uniforms.useShaderPainting = { value: USE_SHADER_PAINTING };
+                shader.uniforms.paintedCellsTexture = { value: dataTexture };
+                shader.uniforms.numPaintedCells = { value: 0 };
+                
+                shader.vertexShader = shader.vertexShader.replace(
+                  '#include <common>',
+                  `#include <common>
+                  varying vec3 vWorldPosition;`
+                );
+                
+                shader.vertexShader = shader.vertexShader.replace(
+                  '#include <worldpos_vertex>',
+                  `#include <worldpos_vertex>
+                  vWorldPosition = (modelMatrix * vec4(position, 1.0)).xyz;`
+                );
+                
+                shader.fragmentShader = shader.fragmentShader.replace(
+                  '#include <common>',
+                  `#include <common>
+                  varying vec3 vWorldPosition;
+                  uniform float gridSize;
+                  uniform vec3 gridColor;
+                  uniform float gridOpacity;
+                  uniform vec3 paintColor;
+                  uniform bool useShaderPainting;
+                  uniform sampler2D paintedCellsTexture;
+                  uniform int numPaintedCells;`
+                );
+                
+                shader.fragmentShader = shader.fragmentShader.replace(
+                  '#include <tonemapping_fragment>',
+                  `#include <tonemapping_fragment>
+                  
+                  // Calcula posição na grid mundial
+                  vec3 gridPos = vWorldPosition / gridSize;
+                  // Índice da célula (qual célula contém este ponto)
+                  vec3 cellCoords = floor(gridPos);
+                                    // Determina o plano dominante da superfície
+                                    vec3 absNormal = abs(normalize(cross(dFdx(vWorldPosition), dFdy(vWorldPosition))));
+                                    // Prioridade de empate igual ao TypeScript: X > Y > Z
+                                    bool isPlaneYZ = absNormal.x >= absNormal.y && absNormal.x >= absNormal.z;
+                                    bool isPlaneXZ = !isPlaneYZ && absNormal.y >= absNormal.z;
+                                    // isPlaneXY é o caso restante
 
-        const materials = Array.isArray(obj.material) ? obj.material : [obj.material];
-        materials.forEach((mat: any) => {
-          if (mat.userData.hasGridOverlay && mat.userData.shaderUniforms?.paintedCellsTexture) {
+                                    // Define o par de coordenadas 2D da célula para o plano atual
+                                    float fragmentPlaneId = 2.0; // XY
+                                    float fragmentCoord1 = cellCoords.x;
+                                    float fragmentCoord2 = cellCoords.y;
+                                    if (isPlaneYZ) {
+                                      fragmentPlaneId = 0.0;
+                                      fragmentCoord1 = cellCoords.y;
+                                      fragmentCoord2 = cellCoords.z;
+                                    } else if (isPlaneXZ) {
+                                      fragmentPlaneId = 1.0;
+                                      fragmentCoord1 = cellCoords.x;
+                                      fragmentCoord2 = cellCoords.z;
+                                    }
+                  
+                  
+                  // Verifica se esta célula está pintada (lê da textura)
+                  bool isPainted = false;
+                  if (useShaderPainting && numPaintedCells > 0) {
+                    for (int i = 0; i < 700; i++) {
+                      if (i >= numPaintedCells) break;
+                      
+                      // Lê coordenadas da textura
+                      float u = (float(i) + 0.5) / 700.0;
+                      vec4 texelData = texture2D(paintedCellsTexture, vec2(u, 0.5));
+                      float paintedCoord1 = texelData.r;
+                      float paintedCoord2 = texelData.g;
+                      float paintedPlaneId = texelData.b;
+                      
+                      // Só pinta se plano + coordenadas 2D forem iguais
+                      bool match = abs(paintedPlaneId - fragmentPlaneId) < 0.1 &&
+                                   abs(paintedCoord1 - fragmentCoord1) < 0.01 &&
+                                   abs(paintedCoord2 - fragmentCoord2) < 0.01;
+                      
+                      if (match) {
+                        isPainted = true;
+                        break;
+                      }
+                    }
+                  }
+                  
+                  // Desenha linhas de grid apenas no plano dominante da superfície
+                  vec3 gridFract = fract(gridPos);
+                  float lineWidth = 0.02;
+                  float gridLine = 0.0;
+                  
+                  // Desenha linhas apenas nos 2 eixos do plano dominante (ignora o eixo perpendicular)
+                  if (isPlaneYZ) {
+                    // Plano YZ (normal em X) - desenha apenas linhas Y e Z
+                    if (gridFract.y < lineWidth || gridFract.y > 1.0 - lineWidth ||
+                        gridFract.z < lineWidth || gridFract.z > 1.0 - lineWidth) {
+                      gridLine = 1.0;
+                    }
+                  } else if (isPlaneXZ) {
+                    // Plano XZ (normal em Y) - desenha apenas linhas X e Z
+                    if (gridFract.x < lineWidth || gridFract.x > 1.0 - lineWidth ||
+                        gridFract.z < lineWidth || gridFract.z > 1.0 - lineWidth) {
+                      gridLine = 1.0;
+                    }
+                  } else {
+                    // Plano XY (normal em Z) - desenha apenas linhas X e Y
+                    if (gridFract.x < lineWidth || gridFract.x > 1.0 - lineWidth ||
+                        gridFract.y < lineWidth || gridFract.y > 1.0 - lineWidth) {
+                      gridLine = 1.0;
+                    }
+                  }
+                  
+                  // Aplica cor da célula pintada
+                  if (isPainted) {
+                    gl_FragColor.rgb = paintColor;
+                  }
+                  
+                  // Overlay das linhas de grid
+                  gl_FragColor.rgb = mix(gl_FragColor.rgb, gridColor, gridLine * gridOpacity);
+                  `
+                );
+                
+                // Guarda referência aos uniforms para atualização posterior
+                mat.userData.shaderUniforms = shader.uniforms;
+              };
+              mat.userData.hasGridOverlay = true;
+              mat.needsUpdate = true;
+              console.log("[SHADER DEBUG] Late shader attachment - set mat.needsUpdate = true");
+            }
+          });
+          
+          console.log(`[SHADER DEBUG] Mesh #${meshCount}:`, {
+            uuid: obj.uuid,
+            hasGridOverlay: materials[0]?.userData?.hasGridOverlay,
+            hasShaderUniforms: !!materials[0]?.userData?.shaderUniforms,
+            paintedCellsTexture: !!materials[0]?.userData?.shaderUniforms?.paintedCellsTexture,
+          });
+          
+          const encodedCells = encodedCellsByMesh.get(obj.uuid) ?? new Set<string>();
+          console.log(`[SHADER DEBUG] Mesh #${meshCount} encoded cells:`, encodedCells.size);
+          
+          const meshCells: number[] = [];
+          for (const encoded of encodedCells) {
+            if (meshCells.length >= 700 * 4) break;
+            const [planeIdRaw, coord1Raw, coord2Raw] = encoded.split(":");
+            const planeId = Number(planeIdRaw);
+            const coord1 = Number(coord1Raw);
+            const coord2 = Number(coord2Raw);
+            if (!Number.isFinite(planeId) || !Number.isFinite(coord1) || !Number.isFinite(coord2)) continue;
+            meshCells.push(coord1, coord2, planeId, 1.0);
+          }
+
+          const cellsArray = meshCells.slice(0, 700 * 4);
+          while (cellsArray.length < 700 * 4) {
+            cellsArray.push(0, 0, 0, 0);
+          }
+          const numCells = Math.floor(meshCells.length / 4);
+
+          materials.forEach((mat: any) => {
+            if (!mat.userData.hasGridOverlay) {
+              console.log("[SHADER DEBUG] Material has no grid overlay");
+              return;
+            }
+
+            if (!mat.userData.shaderUniforms?.paintedCellsTexture) {
+              console.log("[SHADER DEBUG] !!! SHADER NOT COMPILED YET - marking for retry");
+              hasPendingShaderCompile = true;
+              mat.needsUpdate = true;
+              return;
+            }
+
+            console.log("[SHADER DEBUG] Updating texture with", numCells, "cells");
             const texture = mat.userData.shaderUniforms.paintedCellsTexture.value as THREE.DataTexture;
             texture.image.data.set(new Float32Array(cellsArray));
             texture.needsUpdate = true;
             mat.userData.shaderUniforms.numPaintedCells.value = numCells;
-          }
+            didUpdateShaderData = true;
+          });
+        }
+      });
+
+      if (didUpdateShaderData || hasPendingShaderCompile) {
+        console.log("[SHADER DEBUG] Calling invalidate():", {
+          didUpdateShaderData,
+          hasPendingShaderCompile,
+          meshCountProcessed: meshCount,
         });
+        invalidate();
+      } else {
+        console.log("[SHADER DEBUG] !!! No shader data updated and no pending compile - meshCount:", meshCount);
       }
-    });
+
+      return hasPendingShaderCompile;
+    };
+
+    const needsRetry = syncPaintDataToShader();
+    console.log("[SHADER DEBUG] Sync result - needsRetry:", needsRetry);
+    
+    let rafId: number | null = null;
+    if (needsRetry) {
+      console.log("[SHADER DEBUG] Scheduling RAF retry...");
+      rafId = window.requestAnimationFrame(() => {
+        console.log("[SHADER DEBUG] RAF callback - retrying sync");
+        syncPaintDataToShader();
+      });
+    }
+
+    return () => {
+      if (rafId !== null) {
+        window.cancelAnimationFrame(rafId);
+      }
+    };
   }, [paintedCells]);
 
   return (
