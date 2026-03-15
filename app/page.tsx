@@ -12,7 +12,8 @@ import {
   useTexture,
 } from "@react-three/drei";
 import { DecalGeometry } from "three-stdlib";
-import { RenaultMasterCollider as RenaultVan } from "@/Renault_master_collider";
+import { Model as RenaultMasterPanelVan } from "@/Renault_master_panel_van";
+import { RenaultMasterCollider } from "@/Renault_master_collider";
 
 type CameraControlsRef = ComponentRef<typeof CameraControls>;
 
@@ -52,11 +53,13 @@ const SURFACE_PIXEL_OFFSET = 0.015;
 const PIXELS_PER_FACE_EDGE = 12;
 const ENABLE_SURFACE_DECALS = true;
 const USE_SHADER_PAINTING = true; // Usa decals enquanto ajustamos o mapeamento da grid na malha
+const FORCE_SURFACE_DECAL_FALLBACK = false; // Mostra decals só como fallback visual opcional
 const MAX_ACTIVE_SURFACE_DECALS = 700;
 const SHOW_SURFACE_PIXEL_DEBUG_DOT = false;
 const SHOW_DEBUG_GRID = true;
+const USE_COLLIDER_AS_VISUAL_TEST = true;
+const MIN_GRID_CELLS_PER_AXIS = 4; // Garante pelo menos N células em cada eixo projetado (evita linhas faltantes)
 const MIN_SURFACE_ANGLE_DEGREES = 30; // Ângulo mínimo entre normal e plano do grid (evita células muito esticadas)
-const MIN_PIXEL_DISTANCE = 0.15; // Distância mínima entre pixels em unidades mundiais (evita sobreposição)
 
 useGLTF.preload(COLLIDER_MODEL_PATH);
 
@@ -83,6 +86,7 @@ type SurfacePixel = {
   plane: "xy" | "xz" | "yz";
   planeCoord1: number;
   planeCoord2: number;
+  planeCoord3: number;
   sharedPlane?: "xy" | "xz" | "yz";
   sharedPlaneCoord1?: number;
   sharedPlaneCoord2?: number;
@@ -92,6 +96,17 @@ type SurfacePixel = {
   uv?: [number, number];
   position: [number, number, number];
   quaternion: [number, number, number, number];
+};
+
+type SurfaceClickDebug = {
+  meshName: string;
+  partName: string;
+  plane: "xy" | "xz" | "yz";
+  u: number;
+  v: number;
+  depth: number;
+  key: string;
+  action: "add" | "remove";
 };
 
 type SurfaceProjection = {
@@ -166,30 +181,18 @@ function setAxisValue(v: THREE.Vector3, axis: "x" | "y" | "z", value: number) {
   else v.z = value;
 }
 
-function getMeshSurfaceProjection(mesh: THREE.Mesh): SurfaceProjection {
-  const cachedProjection = mesh.userData.surfaceProjection as SurfaceProjection | undefined;
-  if (cachedProjection) return cachedProjection;
+function getDominantNormalAxis(normal: THREE.Vector3): "x" | "y" | "z" {
+  const absX = Math.abs(normal.x);
+  const absY = Math.abs(normal.y);
+  const absZ = Math.abs(normal.z);
+  if (absX >= absY && absX >= absZ) return "x";
+  if (absY >= absZ) return "y";
+  return "z";
+}
 
-  const geometry = mesh.geometry;
-  if (!geometry.boundingBox) {
-    geometry.computeBoundingBox();
-  }
-
-  const boundingBox = geometry.boundingBox ?? new THREE.Box3(new THREE.Vector3(-0.5, -0.5, -0.5), new THREE.Vector3(0.5, 0.5, 0.5));
-  const size = new THREE.Vector3();
-  boundingBox.getSize(size);
-
-  const extents = [
-    { axis: "x" as const, size: size.x },
-    { axis: "y" as const, size: size.y },
-    { axis: "z" as const, size: size.z },
-  ].sort((a, b) => a.size - b.size);
-
-  const normalAxis = extents[0].axis;
-  let projection: SurfaceProjection;
-
+function projectionFromNormalAxis(normalAxis: "x" | "y" | "z", boundingBox: THREE.Box3): SurfaceProjection {
   if (normalAxis === "x") {
-    projection = {
+    return {
       plane: "yz",
       axisA: "y",
       axisB: "z",
@@ -197,8 +200,10 @@ function getMeshSurfaceProjection(mesh: THREE.Mesh): SurfaceProjection {
       originA: boundingBox.min.y,
       originB: boundingBox.min.z,
     };
-  } else if (normalAxis === "y") {
-    projection = {
+  }
+
+  if (normalAxis === "y") {
+    return {
       plane: "xz",
       axisA: "x",
       axisB: "z",
@@ -206,16 +211,58 @@ function getMeshSurfaceProjection(mesh: THREE.Mesh): SurfaceProjection {
       originA: boundingBox.min.x,
       originB: boundingBox.min.z,
     };
-  } else {
-    projection = {
-      plane: "xy",
-      axisA: "x",
-      axisB: "y",
-      normalAxis,
-      originA: boundingBox.min.x,
-      originB: boundingBox.min.y,
-    };
   }
+
+  return {
+    plane: "xy",
+    axisA: "x",
+    axisB: "y",
+    normalAxis,
+    originA: boundingBox.min.x,
+    originB: boundingBox.min.y,
+  };
+}
+
+function getMeshSurfaceProjection(mesh: THREE.Mesh): SurfaceProjection {
+  const cachedProjection = mesh.userData.surfaceProjection as SurfaceProjection | undefined;
+  if (cachedProjection) return cachedProjection;
+
+  const geometry = mesh.geometry;
+  if (!geometry.boundingBox) geometry.computeBoundingBox();
+  const boundingBox = geometry.boundingBox ?? new THREE.Box3(
+    new THREE.Vector3(-0.5, -0.5, -0.5),
+    new THREE.Vector3(0.5, 0.5, 0.5),
+  );
+
+  // Determine dominant normal axis by accumulating absolute normal components
+  // across all vertices. This correctly handles curved/angled surfaces where the
+  // bounding-box "thin axis" approach would pick the wrong projection plane
+  // (e.g. a door that is curved outward = bounding box is NOT thin in X, but
+  // face normals still mostly point in X).
+  let normalAxis: "x" | "y" | "z" = "z";
+  const normalAttr = geometry.getAttribute("normal") as THREE.BufferAttribute | undefined;
+  if (normalAttr && normalAttr.count > 0) {
+    let nx = 0, ny = 0, nz = 0;
+    // Sample up to 512 evenly-spaced vertices for performance.
+    const step = Math.max(1, Math.floor(normalAttr.count / 512));
+    for (let i = 0; i < normalAttr.count; i += step) {
+      nx += Math.abs(normalAttr.getX(i));
+      ny += Math.abs(normalAttr.getY(i));
+      nz += Math.abs(normalAttr.getZ(i));
+    }
+    if (nx >= ny && nx >= nz) normalAxis = "x";
+    else if (ny >= nz) normalAxis = "y";
+    else normalAxis = "z";
+  } else {
+    // Fallback: bounding-box thin axis (original behaviour).
+    const size = new THREE.Vector3();
+    boundingBox.getSize(size);
+    if (size.x <= size.y && size.x <= size.z) normalAxis = "x";
+    else if (size.y <= size.z) normalAxis = "y";
+    else normalAxis = "z";
+  }
+
+  const projection = projectionFromNormalAxis(normalAxis, boundingBox);
 
   mesh.userData.surfaceProjection = projection;
   return projection;
@@ -231,7 +278,35 @@ function getMeshLocalCellSize(
   const axisBScale = Math.abs(getAxisValue(worldScale, projection.axisB));
   const projectedScale = Math.max((axisAScale + axisBScale) * 0.5, 1e-6);
 
-  return worldCellSize / projectedScale;
+  const rawCellSize = worldCellSize / projectedScale;
+
+  // Garante que pelo menos MIN_GRID_CELLS_PER_AXIS células caibam em cada eixo projetado.
+  // Sem isso, peças estreitas (portas, capôs) ficam sem linhas em uma direção.
+  const geometry = mesh.geometry;
+  if (!geometry.boundingBox) geometry.computeBoundingBox();
+  const bboxSize = new THREE.Vector3();
+  geometry.boundingBox!.getSize(bboxSize);
+  const extentA = Math.abs(getAxisValue(bboxSize, projection.axisA));
+  const extentB = Math.abs(getAxisValue(bboxSize, projection.axisB));
+  const maxFromA = extentA > 0 ? extentA / MIN_GRID_CELLS_PER_AXIS : rawCellSize;
+  const maxFromB = extentB > 0 ? extentB / MIN_GRID_CELLS_PER_AXIS : rawCellSize;
+
+  return Math.min(rawCellSize, maxFromA, maxFromB);
+}
+
+function getCachedMeshLocalCellSize(
+  mesh: THREE.Mesh,
+  projection: SurfaceProjection,
+  worldCellSize: number,
+) {
+  const cacheByPlane = (mesh.userData.surfaceLocalCellSizeByPlane as Partial<Record<"xy" | "xz" | "yz", number>> | undefined) ?? {};
+  const cachedCellSize = cacheByPlane[projection.plane];
+  if (Number.isFinite(cachedCellSize) && (cachedCellSize as number) > 0) return cachedCellSize as number;
+
+  const computedCellSize = getMeshLocalCellSize(mesh, projection, worldCellSize);
+  cacheByPlane[projection.plane] = computedCellSize;
+  mesh.userData.surfaceLocalCellSizeByPlane = cacheByPlane;
+  return computedCellSize;
 }
 
 function snapPointToSurfaceGrid(
@@ -269,21 +344,6 @@ function isSurfaceAngleValid(normal: THREE.Vector3): boolean {
   
   // Se a componente dominante é maior que o threshold, o ângulo é ok
   return maxComponent >= minDot;
-}
-
-function isPositionTooClose(
-  position: [number, number, number],
-  existingPixels: Map<string, SurfacePixel>,
-  minDistance: number
-): boolean {
-  const pos = new THREE.Vector3(...position);
-  for (const pixel of existingPixels.values()) {
-    const existingPos = new THREE.Vector3(...pixel.position);
-    if (pos.distanceTo(existingPos) < minDistance) {
-      return true;
-    }
-  }
-  return false;
 }
 
 function getMeshDisplayName(mesh: THREE.Mesh) {
@@ -578,11 +638,16 @@ function VanModel({
           cloneMeshMaterialsOnce(obj);
         }
         
-        // Aplica shader de grid debug se habilitado
-        if (SHOW_DEBUG_GRID && obj.material) {
-          const gridProjection = getMeshSurfaceProjection(obj);
-          const localGridSize = getMeshLocalCellSize(obj, gridProjection, SURFACE_PIXEL_WORLD_SIZE);
-          const gridPlaneId = gridProjection.plane === "yz" ? 0 : gridProjection.plane === "xz" ? 1 : 2;
+        // Aplica shader quando grid debug ou shader painting estiver habilitado
+        if ((SHOW_DEBUG_GRID || USE_SHADER_PAINTING) && obj.material) {
+          if (!obj.geometry.boundingBox) obj.geometry.computeBoundingBox();
+          const bbox = obj.geometry.boundingBox!;
+          const projectionYZ = projectionFromNormalAxis("x", bbox);
+          const projectionXZ = projectionFromNormalAxis("y", bbox);
+          const projectionXY = projectionFromNormalAxis("z", bbox);
+          const gridSizeYZ = getCachedMeshLocalCellSize(obj, projectionYZ, SURFACE_PIXEL_WORLD_SIZE);
+          const gridSizeXZ = getCachedMeshLocalCellSize(obj, projectionXZ, SURFACE_PIXEL_WORLD_SIZE);
+          const gridSizeXY = getCachedMeshLocalCellSize(obj, projectionXY, SURFACE_PIXEL_WORLD_SIZE);
           const materials = Array.isArray(obj.material) ? obj.material : [obj.material];
           
           materials.forEach((mat, idx) => {
@@ -591,12 +656,15 @@ function VanModel({
               console.log(`    ⚙️ Installing grid shader on material ${idx}`);
               // FORÇA recompilação removendo program cache
               mat.needsUpdate = true;
+              const programCacheKey = `grid-overlay:${obj.uuid}:${idx}`;
+              (mat as THREE.Material & { customProgramCacheKey?: () => string }).customProgramCacheKey = () => programCacheKey;
               if ((mat as any).program) {
                 delete (mat as any).program;
               }
               
               mat.onBeforeCompile = (shader: any) => {
                 console.log(`    ✅ onBeforeCompile fired for material ${idx}`);
+
                 // Cria textura para armazenar células pintadas (mais eficiente que array de uniforms)
                 const dataTexture = new THREE.DataTexture(
                   new Float32Array(700 * 4), // 700 células, 4 componentes RGBA
@@ -612,12 +680,11 @@ function VanModel({
                 dataTexture.generateMipmaps = false;
                 dataTexture.needsUpdate = true;
                 
-                shader.uniforms.gridSize = { value: localGridSize };
+                shader.uniforms.gridSizeByPlane = { value: new THREE.Vector3(gridSizeYZ, gridSizeXZ, gridSizeXY) };
                 shader.uniforms.gridColor = { value: new THREE.Color(0x00ff00) };
-                shader.uniforms.gridOpacity = { value: 0.85 };
+                shader.uniforms.gridOpacity = { value: SHOW_DEBUG_GRID ? 0.85 : 0.0 };
                 shader.uniforms.paintColor = { value: new THREE.Color(0xff2d55) };
-                shader.uniforms.gridOrigin = { value: new THREE.Vector2(gridProjection.originA, gridProjection.originB) };
-                shader.uniforms.gridPlaneId = { value: gridPlaneId };
+                shader.uniforms.gridOriginMin = { value: new THREE.Vector3(bbox.min.x, bbox.min.y, bbox.min.z) };
                 shader.uniforms.useShaderPainting = { value: USE_SHADER_PAINTING };
                 shader.uniforms.paintedCellsTexture = { value: dataTexture };
                 shader.uniforms.numPaintedCells = { value: 0 };
@@ -626,14 +693,16 @@ function VanModel({
                   '#include <common>',
                   `#include <common>
                   varying vec3 vWorldPosition;
-                  varying vec3 vLocalPosition;`
+                  varying vec3 vLocalPosition;
+                  varying vec3 vLocalNormal;`
                 );
                 
                 shader.vertexShader = shader.vertexShader.replace(
-                  '#include <worldpos_vertex>',
-                  `#include <worldpos_vertex>
+                  '#include <begin_vertex>',
+                  `#include <begin_vertex>
                   vWorldPosition = (modelMatrix * vec4(position, 1.0)).xyz;
-                  vLocalPosition = position;`
+                  vLocalPosition = position;
+                  vLocalNormal = normal;`
                 );
                 
                 shader.fragmentShader = shader.fragmentShader.replace(
@@ -641,12 +710,12 @@ function VanModel({
                   `#include <common>
                   varying vec3 vWorldPosition;
                   varying vec3 vLocalPosition;
-                  uniform float gridSize;
+                  varying vec3 vLocalNormal;
+                  uniform vec3 gridSizeByPlane;
                   uniform vec3 gridColor;
                   uniform float gridOpacity;
                   uniform vec3 paintColor;
-                  uniform vec2 gridOrigin;
-                  uniform float gridPlaneId;
+                  uniform vec3 gridOriginMin;
                   uniform bool useShaderPainting;
                   uniform sampler2D paintedCellsTexture;
                   uniform int numPaintedCells;`
@@ -656,21 +725,45 @@ function VanModel({
                   '#include <tonemapping_fragment>',
                   `#include <tonemapping_fragment>
 
-                  // Tinta base para validar visualmente que o shader foi injetado.
-                  gl_FragColor.rgb = mix(gl_FragColor.rgb, vec3(0.0, 0.22, 0.0), 0.18);
-                  
-                  vec2 surfaceCoords = vLocalPosition.xy;
-                  if (gridPlaneId < 0.5) {
-                    surfaceCoords = vLocalPosition.yz;
-                  } else if (gridPlaneId < 1.5) {
-                    surfaceCoords = vLocalPosition.xz;
+                  // Seleciona o plano por fragmento usando a normal local dominante.
+                  // Isso cobre melhor regiões com ângulos muito diferentes na mesma peça.
+                  vec3 geometricNormal = normalize(cross(dFdx(vLocalPosition), dFdy(vLocalPosition)));
+                  vec3 absN = abs(geometricNormal);
+                  if (absN.x + absN.y + absN.z < 1e-5) {
+                    absN = abs(vLocalNormal);
                   }
+                  vec2 surfaceCoords;
+                  vec2 effectiveOrigin;
+                  float fragmentPlaneId;
+                  float currentGridSize;
+                  float normalSide;
+                  if (absN.x >= absN.y && absN.x >= absN.z) {
+                    surfaceCoords = vLocalPosition.yz;
+                    effectiveOrigin = gridOriginMin.yz;
+                    fragmentPlaneId = 0.0;
+                    currentGridSize = max(gridSizeByPlane.x, 1e-6);
+                    normalSide = geometricNormal.x >= 0.0 ? 1.0 : 0.0;
+                  } else if (absN.y >= absN.z) {
+                    surfaceCoords = vLocalPosition.xz;
+                    effectiveOrigin = gridOriginMin.xz;
+                    fragmentPlaneId = 1.0;
+                    currentGridSize = max(gridSizeByPlane.y, 1e-6);
+                    normalSide = geometricNormal.y >= 0.0 ? 1.0 : 0.0;
+                  } else {
+                    surfaceCoords = vLocalPosition.xy;
+                    effectiveOrigin = gridOriginMin.xy;
+                    fragmentPlaneId = 2.0;
+                    currentGridSize = max(gridSizeByPlane.z, 1e-6);
+                    normalSide = geometricNormal.z >= 0.0 ? 1.0 : 0.0;
+                  }
+                  const float cellEpsilon = 1e-4;
 
-                  vec2 surfaceGridPos = (surfaceCoords - gridOrigin) / gridSize;
-                  vec2 cellCoords = floor(surfaceGridPos);
-                  float fragmentPlaneId = gridPlaneId;
+                  vec2 surfaceGridPos = (surfaceCoords - effectiveOrigin) / currentGridSize;
+                  vec2 stableGridPos = surfaceGridPos + vec2(cellEpsilon);
+                  vec2 cellCoords = floor(stableGridPos);
                   float fragmentCoord1 = cellCoords.x;
                   float fragmentCoord2 = cellCoords.y;
+                  float fragmentCoord3 = normalSide;
                   
                   
                   // Verifica se esta célula está pintada (lê da textura)
@@ -684,12 +777,14 @@ function VanModel({
                       vec4 texelData = texture2D(paintedCellsTexture, vec2(u, 0.5));
                       float paintedCoord1 = texelData.r;
                       float paintedCoord2 = texelData.g;
-                      float paintedPlaneId = texelData.b;
+                      float paintedCoord3 = texelData.b;
+                      float paintedPlaneId = texelData.a;
                       
                       // Só pinta se plano + coordenadas 2D forem iguais
                       bool match = abs(paintedPlaneId - fragmentPlaneId) < 0.1 &&
-                                   abs(paintedCoord1 - fragmentCoord1) < 0.01 &&
-                                   abs(paintedCoord2 - fragmentCoord2) < 0.01;
+                                   abs(paintedCoord1 - fragmentCoord1) < 0.5 &&
+                                   abs(paintedCoord2 - fragmentCoord2) < 0.5 &&
+                                   abs(paintedCoord3 - fragmentCoord3) < 0.5;
                       
                       if (match) {
                         isPainted = true;
@@ -697,12 +792,18 @@ function VanModel({
                       }
                     }
                   }
+
+                  // Linhas da grade no MESMO plano usado para identificar célula pintada.
+                  // Isso elimina desalinhamento visual (fill x borda) em superfícies curvas.
+                  vec2 lineGridPos = stableGridPos;
                   
-                  vec2 gridFract = fract(surfaceGridPos);
+                  vec2 gridFract = fract(lineGridPos);
                   vec2 gridEdgeDistance = min(gridFract, 1.0 - gridFract);
                   float lineWidth = 0.035;
-                  float edgeU = 1.0 - smoothstep(lineWidth, lineWidth + fwidth(surfaceGridPos.x), gridEdgeDistance.x);
-                  float edgeV = 1.0 - smoothstep(lineWidth, lineWidth + fwidth(surfaceGridPos.y), gridEdgeDistance.y);
+                  float fwU = max(fwidth(lineGridPos.x), 1e-4);
+                  float fwV = max(fwidth(lineGridPos.y), 1e-4);
+                  float edgeU = 1.0 - smoothstep(lineWidth, lineWidth + fwU, gridEdgeDistance.x);
+                  float edgeV = 1.0 - smoothstep(lineWidth, lineWidth + fwV, gridEdgeDistance.y);
                   float gridLine = max(edgeU, edgeV);
                   
                   // Aplica cor da célula pintada
@@ -763,63 +864,34 @@ function VanModel({
     if (!USE_SHADER_PAINTING || !paintedCells || !visualGroupRef.current) return;
 
     // Agrupa por partName (cada parte tem sua própria grid)
-    const encodedCellsByPart = new Map<string, Set<string>>();
-
-    const addEncodedCell = (
-      partName: string,
-      plane: "xy" | "xz" | "yz",
-      coord1: number,
-      coord2: number,
-    ) => {
-      if (!Number.isFinite(coord1) || !Number.isFinite(coord2)) return;
-
-      const planeId = plane === "yz" ? 0 : plane === "xz" ? 1 : 2;
-      const encoded = `${planeId}:${coord1}:${coord2}`;
-      const current = encodedCellsByPart.get(partName) ?? new Set<string>();
-      current.add(encoded);
-      encodedCellsByPart.set(partName, current);
-    };
-
+    const pixelsByPart = new Map<string, SurfacePixel[]>();
     paintedCells.forEach((pixel) => {
-      const fallbackCellX = Math.floor(pixel.position[0] / SURFACE_PIXEL_WORLD_SIZE);
-      const fallbackCellY = Math.floor(pixel.position[1] / SURFACE_PIXEL_WORLD_SIZE);
-      const fallbackCellZ = Math.floor(pixel.position[2] / SURFACE_PIXEL_WORLD_SIZE);
-
-      const plane = pixel.plane ?? "xy";
-      const planeCoord1 = Number.isFinite(pixel.planeCoord1)
-        ? pixel.planeCoord1
-        : (plane === "yz" ? fallbackCellY : fallbackCellX);
-      const planeCoord2 = Number.isFinite(pixel.planeCoord2)
-        ? pixel.planeCoord2
-        : (plane === "xy" ? fallbackCellY : fallbackCellZ);
-
-      addEncodedCell(pixel.partName, plane, planeCoord1, planeCoord2);
-
-      if (pixel.sharedPlane && pixel.sharedPlaneCoord1 != null && pixel.sharedPlaneCoord2 != null) {
-        const sharedPlane = pixel.sharedPlane;
-        const sharedCoord1 = Number.isFinite(pixel.sharedPlaneCoord1)
-          ? pixel.sharedPlaneCoord1
-          : (sharedPlane === "yz" ? fallbackCellY : fallbackCellX);
-        const sharedCoord2 = Number.isFinite(pixel.sharedPlaneCoord2)
-          ? pixel.sharedPlaneCoord2
-          : (sharedPlane === "xy" ? fallbackCellY : fallbackCellZ);
-        addEncodedCell(pixel.partName, sharedPlane, sharedCoord1, sharedCoord2);
-      }
+      const arr = pixelsByPart.get(pixel.partName) ?? [];
+      arr.push(pixel);
+      pixelsByPart.set(pixel.partName, arr);
     });
     
     visualGroupRef.current.traverse((obj) => {
       if (isMeshObject(obj) && obj.material) {
         const meshPartName = obj.uuid;
-        const encodedCells = encodedCellsByPart.get(meshPartName) ?? new Set<string>();
+        const meshPixels = pixelsByPart.get(meshPartName) ?? [];
+
         const meshCells: number[] = [];
-        for (const encoded of encodedCells) {
+        const uniqueCells = new Set<string>();
+        for (const pixel of meshPixels) {
           if (meshCells.length >= 700 * 4) break;
-          const [planeIdRaw, coord1Raw, coord2Raw] = encoded.split(":");
-          const planeId = Number(planeIdRaw);
-          const coord1 = Number(coord1Raw);
-          const coord2 = Number(coord2Raw);
-          if (!Number.isFinite(planeId) || !Number.isFinite(coord1) || !Number.isFinite(coord2)) continue;
-          meshCells.push(coord1, coord2, planeId, 1.0);
+
+          const coord1 = pixel.planeCoord1;
+          const coord2 = pixel.planeCoord2;
+          const coord3 = pixel.planeCoord3;
+          const planeId = pixel.plane === "yz" ? 0 : pixel.plane === "xz" ? 1 : 2;
+          if (!Number.isFinite(planeId) || !Number.isFinite(coord1) || !Number.isFinite(coord2) || !Number.isFinite(coord3)) continue;
+
+          const encoded = `${coord1}:${coord2}:${coord3}:${planeId}`;
+          if (uniqueCells.has(encoded)) continue;
+          uniqueCells.add(encoded);
+
+          meshCells.push(coord1, coord2, coord3, planeId);
         }
 
         const cellsArray = meshCells.slice(0, 700 * 4);
@@ -851,11 +923,19 @@ function VanModel({
         onPointerOut={useColliderProxy ? undefined : onPointerOut}
         onPointerDown={useColliderProxy ? undefined : onPointerDown}
       >
-        <RenaultVan
-          scale={0.02}
-          rotation={[-Math.PI / 2, 0, 0]}
-          position={[0, -2.5, 0]}
-        />
+        {USE_COLLIDER_AS_VISUAL_TEST ? (
+          <RenaultMasterCollider
+            scale={0.02}
+            rotation={[-Math.PI / 2, 0, 0]}
+            position={[0, -2.5, 0]}
+          />
+        ) : (
+          <RenaultMasterPanelVan
+            scale={0.02}
+            rotation={[-Math.PI / 2, 0, 0]}
+            position={[0, -2.5, 0]}
+          />
+        )}
       </group>
 
       {useColliderProxy && (
@@ -1055,6 +1135,8 @@ export default function Page() {
   const [reservedSurfacePixels, setReservedSurfacePixels] = useState<Map<string, SurfacePixel>>(new Map());
   const [meshRegistry, setMeshRegistry] = useState<MeshInfo[]>([]);
   const [selectedMeshUuid, setSelectedMeshUuid] = useState<string | null>(null);
+  const [forceSurfaceDecalFallback, setForceSurfaceDecalFallback] = useState(FORCE_SURFACE_DECAL_FALLBACK);
+  const [lastSurfaceClick, setLastSurfaceClick] = useState<SurfaceClickDebug | null>(null);
   const lastHoverKeyRef = useRef<string | null>(null);
   const meshObjectsRef = useRef<Map<string, THREE.Mesh>>(new Map());
   const raycasterRef = useRef(new THREE.Raycaster());
@@ -1067,11 +1149,11 @@ export default function Page() {
   }, [reservedCells]);
 
   const buildSurfacePixel = useCallback((e: ThreeEvent<PointerEvent>) => {
-    if (!e.face || e.faceIndex == null) return null;
+    if (!isMeshObject(e.object)) return null;
 
-    const hitMesh = e.object as THREE.Mesh;
+    const hitMesh = e.object;
     const hitMeshName = getMeshDisplayName(hitMesh);
-    const faceIndexFromHit = e.faceIndex;
+    const faceIndexFromHit = e.faceIndex ?? 0;
 
     let targetMesh = meshObjectsRef.current.get(hitMesh.uuid);
     if (!targetMesh) {
@@ -1099,46 +1181,40 @@ export default function Page() {
     const faceIndex = visualHit?.faceIndex ?? faceIndexFromHit;
     const projectedUv = visualHit?.uv ?? e.uv ?? null;
 
-    const projectedPoint = (visualHit?.point ?? e.point).clone();
-    const localProjectedPoint = resolvedMesh.worldToLocal(projectedPoint.clone());
-    const meshProjection = getMeshSurfaceProjection(resolvedMesh);
-    const localCellSize = getMeshLocalCellSize(resolvedMesh, meshProjection, SURFACE_PIXEL_WORLD_SIZE);
+    const hitPoint = (visualHit?.point ?? e.point).clone();
+    const localHitPoint = resolvedMesh.worldToLocal(hitPoint.clone());
 
-    const baseNormal = visualHit?.face?.normal ?? e.face.normal;
-    const worldNormal = baseNormal.clone().transformDirection(resolvedMesh.matrixWorld).normalize();
-    
-    // Snap no plano local da peça para manter a grid estável na malha.
-    const snapped = snapPointToSurfaceGrid(localProjectedPoint, meshProjection, localCellSize);
-
-    // Recalcula normal na posição snapped fazendo raycast da posição do grid
-    const raycaster = raycasterRef.current;
-    const snappedWorldPoint = resolvedMesh.localToWorld(snapped.snappedPoint.clone());
-    const rayOrigin = snappedWorldPoint.clone().add(worldNormal.clone().multiplyScalar(0.5));
-    const rayDirection = worldNormal.clone().negate();
-    raycaster.set(rayOrigin, rayDirection);
-    
-    const snappedHit = raycaster.intersectObject(resolvedMesh, false)[0];
-    const finalNormal = snappedHit?.face 
-      ? snappedHit.face.normal.clone().transformDirection(resolvedMesh.matrixWorld).normalize()
-      : worldNormal;
-
-    // Valida o ângulo da superfície para evitar células muito esticadas/sobrepostas
-    if (!isSurfaceAngleValid(finalNormal)) {
-      return null; // Rejeita posicionamento em superfícies muito inclinadas
+    // Local face normal — fallback to mesh projection axis when raycast face data is missing.
+    // This keeps selection working consistently after reloads/drivers that omit intersection face.
+    let localFaceNormal = visualHit?.face?.normal?.clone() ?? e.face?.normal?.clone();
+    if (!localFaceNormal) {
+      const fallbackProjection = getMeshSurfaceProjection(resolvedMesh);
+      localFaceNormal = new THREE.Vector3(
+        fallbackProjection.normalAxis === "x" ? 1 : 0,
+        fallbackProjection.normalAxis === "y" ? 1 : 0,
+        fallbackProjection.normalAxis === "z" ? 1 : 0,
+      );
     }
+    localFaceNormal.normalize();
 
-    // Apply a tiny offset to avoid z-fighting while keeping the decal attached to surface.
-    const decalPosition = snappedWorldPoint.clone().add(finalNormal.clone().multiplyScalar(SURFACE_PIXEL_OFFSET));
+    if (!resolvedMesh.geometry.boundingBox) resolvedMesh.geometry.computeBoundingBox();
+    const meshBoundingBox = resolvedMesh.geometry.boundingBox!;
+    const hitProjection = projectionFromNormalAxis(getDominantNormalAxis(localFaceNormal), meshBoundingBox);
+    const localCellSize = getCachedMeshLocalCellSize(resolvedMesh, hitProjection, SURFACE_PIXEL_WORLD_SIZE);
+    const snapped = snapPointToSurfaceGrid(localHitPoint, hitProjection, localCellSize);
+    const snappedWorldPoint = resolvedMesh.localToWorld(snapped.snappedPoint.clone());
+    const normalSideCell = getAxisValue(localFaceNormal, hitProjection.normalAxis) >= 0 ? 1 : 0;
 
-    const quat = surfaceQuaternionFromNormal(finalNormal);
-  const plane = meshProjection.plane;
-    const planeCoord1 = snapped.gridU;
-    const planeCoord2 = snapped.gridV;
-    const sharedPlane = undefined;
-    const sharedPlaneCoord1 = undefined;
-    const sharedPlaneCoord2 = undefined;
-  const key = `${partName}:${plane}:${snapped.gridU}:${snapped.gridV}`;
-    
+    // World normal oriented toward the camera (flip if face is back-facing relative to ray).
+    const worldNormal = localFaceNormal.clone().transformDirection(resolvedMesh.matrixWorld).normalize();
+    if (worldNormal.dot(e.ray.direction) > 0) worldNormal.negate();
+
+    const decalPosition = snappedWorldPoint.clone().add(worldNormal.clone().multiplyScalar(SURFACE_PIXEL_OFFSET));
+    const quat = surfaceQuaternionFromNormal(worldNormal);
+
+    const plane = hitProjection.plane;
+    const key = `${partName}:${plane}:${snapped.gridU}:${snapped.gridV}:${normalSideCell}`;
+
     return {
       pixel: {
         key,
@@ -1146,11 +1222,12 @@ export default function Page() {
         meshUuid,
         meshName,
         plane,
-        planeCoord1,
-        planeCoord2,
-        sharedPlane,
-        sharedPlaneCoord1,
-        sharedPlaneCoord2,
+        planeCoord1: snapped.gridU,
+        planeCoord2: snapped.gridV,
+        planeCoord3: normalSideCell,
+        sharedPlane: undefined,
+        sharedPlaneCoord1: undefined,
+        sharedPlaneCoord2: undefined,
         faceIndex,
         gridU: snapped.gridU,
         gridV: snapped.gridV,
@@ -1338,20 +1415,28 @@ export default function Page() {
 
       setReservedSurfacePixels((prev) => {
         const next = new Map(prev);
-        if (next.has(surfaceHit.key)) {
+        const wasSelected = next.has(surfaceHit.key);
+        if (wasSelected) {
           next.delete(surfaceHit.key);
         } else {
-          // Verifica se não está muito próximo de outro pixel (evita sobreposição)
-          if (isPositionTooClose(surfaceHit.pixel.position, prev, MIN_PIXEL_DISTANCE)) {
-            return prev; // Não adiciona
-          }
-          
           next.set(surfaceHit.key, surfaceHit.pixel);
           if (next.size > MAX_ACTIVE_SURFACE_DECALS) {
             const oldestKey = next.keys().next().value as string | undefined;
             if (oldestKey) next.delete(oldestKey);
           }
         }
+
+        setLastSurfaceClick({
+          meshName: surfaceHit.pixel.meshName,
+          partName: surfaceHit.pixel.partName,
+          plane: surfaceHit.pixel.plane,
+          u: surfaceHit.pixel.planeCoord1,
+          v: surfaceHit.pixel.planeCoord2,
+          depth: surfaceHit.pixel.planeCoord3,
+          key: surfaceHit.key,
+          action: wasSelected ? "remove" : "add",
+        });
+
         return next;
       });
       return;
@@ -1487,6 +1572,21 @@ export default function Page() {
             <p className="text-xs font-semibold uppercase tracking-wide text-white/90">Modo Remap Surface</p>
             <p className="mt-1 text-xs text-white/70">Pixels mapeados por face da mesh low-poly.</p>
             <p className="mt-1 text-xs text-white/70">Grade de {PIXELS_PER_FACE_EDGE}x{PIXELS_PER_FACE_EDGE} por triangulo.</p>
+            {lastSurfaceClick && (
+              <div className="mt-2 rounded border border-white/15 bg-black/30 p-2 text-[11px] text-white/75">
+                <p>Ultimo clique: {lastSurfaceClick.action === "add" ? "ADD" : "REMOVE"}</p>
+                <p>Mesh: {lastSurfaceClick.meshName}</p>
+                <p>Plane: {lastSurfaceClick.plane} | Cell: {lastSurfaceClick.u}, {lastSurfaceClick.v}, side:{lastSurfaceClick.depth}</p>
+              </div>
+            )}
+            <label className="mt-2 flex items-center gap-2 text-xs text-white/80">
+              <input
+                type="checkbox"
+                checked={forceSurfaceDecalFallback}
+                onChange={(e) => setForceSurfaceDecalFallback(e.target.checked)}
+              />
+              Forcar fallback visual (decal)
+            </label>
           </div>
         )}
       </div>
@@ -1560,7 +1660,7 @@ export default function Page() {
             colliderModelPath={COLLIDER_MODEL_PATH}
             paintedCells={reservedSurfacePixels}
           />
-          {PIXEL_MAPPING_MODE === "surface" && !USE_SHADER_PAINTING && (
+          {PIXEL_MAPPING_MODE === "surface" && (!USE_SHADER_PAINTING || forceSurfaceDecalFallback) && (
             <SurfacePixelOverlay
               pixels={surfacePixels}
               meshObjects={meshObjectsRef.current}
